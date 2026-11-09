@@ -40,10 +40,11 @@ button.g{background:transparent;color:var(--gold)}button:disabled{opacity:.4}but
 <div class="bar"><h2>غرفة <span id="rc"></span></h2><span id="phase"></span><span id="timer"></span></div>
 <div class="layout"><div>
 <div id="hint" class="panel"></div><div class="grid" id="cards"></div>
-<div class="row"><button id="startb" onclick="start()">ابدأ اللعبة</button><button class="g" onclick="voice()" id="vb">🎙️ تفعيل الصوت</button></div></div>
+<div class="row"><button id="startb" onclick="start()">ابدأ اللعبة</button><button class="g" onclick="copyInv()">🔗 رابط الدعوة</button><button class="g" onclick="voice()" id="vb">🎙️ تفعيل الصوت</button></div></div>
 <div class="panel"><div id="msgs"></div><input id="ci" placeholder="اكتب رسالة…" maxlength="200"></div></div>
 </section></main>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.4/peerjs.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"></script>
 <script>
 // ===== إعدادات =====
 const DISCORD_CLIENT_ID=''; // ضع معرّف تطبيق Discord هنا لتفعيل الدخول (اختياري)
@@ -60,35 +61,47 @@ async function login(mode){const n=$('u').value.trim().slice(0,16),p=$('p').valu
  if(mode==='reg'){if(d[n])return $('err').textContent='الاسم مستخدم';d[n]={h,points:0,wins:0,games:0};saveDB(d)}
  else if(!d[n]||d[n].h!==h)return $('err').textContent='اسم أو كلمة مرور خاطئة';
  enter(n)}
-function enter(n){me=n;const u=DB()[n]||{points:0,wins:0,games:0};$('who').textContent=n;$('stats').textContent=`${u.points} نقطة · ${u.wins} فوز من ${u.games}`;show('lobby')}
+function enter(n){me=n;const u=DB()[n]||{points:0,wins:0,games:0};$('who').textContent=n;$('stats').textContent=`${u.points} نقطة · ${u.wins} فوز من ${u.games}`;show('lobby');if(sessionStorage.inv){$('code').value=sessionStorage.inv;delete sessionStorage.inv;joinRoom()}}
 function discord(){if(!DISCORD_CLIENT_ID)return $('err').textContent='لتفعيل Discord ضع DISCORD_CLIENT_ID في أعلى السكربت وأضف رابط الصفحة كـ Redirect.';
  location.href=`https://discord.com/api/oauth2/authorize?client_id=${DISCORD_CLIENT_ID}&redirect_uri=${encodeURIComponent(location.origin+location.pathname)}&response_type=token&scope=identify`}
 const tk=location.hash.match(/access_token=([\w.-]+)/);
 if(tk){history.replaceState(0,'',location.pathname);fetch('https://discord.com/api/users/@me',{headers:{Authorization:'Bearer '+tk[1]}}).then(r=>r.json()).then(u=>{const d=DB(),n='d_'+u.username;d[n]=d[n]||{points:0,wins:0,games:0};saveDB(d);enter(n)}).catch(()=>$('err').textContent='فشل الدخول عبر Discord')}
 
-// ===== الشبكة (PeerJS: المضيف يعمل كخادم اللعبة) =====
-let peer,myId,isHost,conns={},hostConn,R,st,stream;
+// ===== الشبكة: وسيط MQTT عبر WebSocket (يعمل خلف أي شبكة، بدون NAT) =====
+const BROKERS=['wss://broker.emqx.io:8084/mqtt','wss://broker.hivemq.com:8884/mqtt'],T='mafia-x7k/';
+let cl,room,isHost,R,st,stream,vpeer,joinT;const myId=Math.random().toString(36).slice(2,10);
 const code5=()=>Math.random().toString(36).slice(2,7).toUpperCase();
-const send=(id,m)=>id===myId?onMsg(m):conns[id]&&conns[id].open&&conns[id].send(m);
-const act=(k,t)=>isHost?handle(myId,{k,t}):hostConn.send({k,t});
-const fail=e=>alert('خطأ في الاتصال: '+(e.type==='peer-unavailable'?'الغرفة غير موجودة':e.type));
-function createRoom(){const code=code5();peer=new Peer('mafia-'+code);peer.on('error',e=>e.type==='unavailable-id'?createRoom():fail(e));
- peer.on('open',id=>{myId=id;isHost=true;calls();R={code,host:id,players:[{id,name:me,alive:true}],phase:'lobby',log:[],votes:{}};push()});
- peer.on('connection',c=>{c.on('data',m=>handle(c.peer,m,c));c.on('close',()=>drop(c.peer))})}
-function joinRoom(){const code=$('code').value.trim().toUpperCase();if(!code)return;peer=new Peer();peer.on('error',fail);
- peer.on('open',id=>{myId=id;calls();hostConn=peer.connect('mafia-'+code,{reliable:true});
-  hostConn.on('open',()=>hostConn.send({k:'join',name:me}));hostConn.on('data',onMsg);
-  hostConn.on('close',()=>{alert('انقطع الاتصال بالمضيف');location.reload()})})}
-function onMsg(m){if(m.k==='state'){st=m.s;render()}else if(m.k==='chat')say(m.t,m.m?'m':'',m.n);else if(m.k==='info')say(`🕵️ ${m.n} ${m.mafia?'من المافيا!':'ليس من المافيا'}`,'sys');else if(m.k==='err'){alert(m.m);location.reload()}}
+const pub=(t,m)=>cl&&cl.connected&&cl.publish(t,JSON.stringify(m));
+const send=(id,m)=>id===myId?onMsg(m):pub(T+room+'/g/'+id,m);
+const act=(k,t)=>isHost?handle(myId,{k,t}):pub(T+room+'/h',{k,t,from:myId});
+function connect(will,topics,ready){let i=0,done=0;
+ const go=()=>{const c=cl=mqtt.connect(BROKERS[i],{connectTimeout:6000,reconnectPeriod:0,will:{topic:will[0],payload:JSON.stringify(will[1])}});
+  c.on('connect',()=>{done=1;c.options.reconnectPeriod=3000;c.subscribe(topics,e=>e?alert('فشل الاشتراك'):ready())});
+  c.on('message',(t,m)=>{let d;try{d=JSON.parse(m)}catch{return}isHost?handle(d.from,d):onMsg(d)});
+  const bad=()=>{if(done)return;c.end(true);++i<BROKERS.length?go():alert('تعذّر الاتصال بخادم الوسيط. تحقق من الإنترنت وجرّب مجدداً.')};
+  c.on('error',bad);c.on('close',bad)};go()}
+function createRoom(){room=code5();isHost=true;
+ connect([T+room+'/all',{k:'hostgone'}],[T+room+'/h'],()=>{R={code:room,host:myId,players:[{id:myId,name:me,alive:true}],phase:'lobby',log:[],votes:{}};push()})}
+function joinRoom(){const code=$('code').value.trim().toUpperCase();if(!code)return;room=code;isHost=false;
+ connect([T+room+'/h',{k:'bye',from:myId}],[T+room+'/g/'+myId,T+room+'/all'],()=>{
+  pub(T+room+'/h',{k:'join',name:me,from:myId});
+  joinT=setTimeout(()=>{alert('الغرفة غير موجودة أو صاحبها غير متصل. تأكد من الكود.');location.reload()},8000)})}
+function onMsg(m){if(m.k==='state'){clearTimeout(joinT);st=m.s;render()}else if(m.k==='chat')say(m.t,m.m?'m':'',m.n);
+ else if(m.k==='info')say(`🕵️ ${m.n} ${m.mafia?'من المافيا!':'ليس من المافيا'}`,'sys');
+ else if(m.k==='hostgone'){alert('غادر صاحب الغرفة، انتهت اللعبة');location.reload()}
+ else if(m.k==='err'){alert(m.m);location.reload()}}
+const link=()=>location.origin+location.pathname+'?room='+room;
+function copyInv(){navigator.clipboard.writeText(link()).then(()=>alert('تم نسخ رابط الدعوة:\n'+link()),()=>prompt('انسخ الرابط:',link()))}
+const inv=new URLSearchParams(location.search).get('room');if(inv){sessionStorage.inv=inv.toUpperCase();history.replaceState(0,'',location.pathname)}
 
 // ===== منطق اللعبة (يعمل عند المضيف) =====
 const alive=role=>R.players.filter(p=>p.alive&&(!role||p.role===role)),byId=id=>R.players.find(p=>p.id===id);
 const view=p=>({code:R.code,host:R.host,phase:R.phase,end:R.end,role:p.role,log:R.log,win:R.win,
  players:R.players.map(x=>({id:x.id,name:x.name,alive:x.alive,role:(R.phase==='over'||x.id===p.id||(p.role==='mafia'&&x.role==='mafia'))?x.role:undefined,votes:R.phase==='day'?Object.values(R.votes).filter(v=>v===x.id).length:0}))});
 const push=()=>R.players.forEach(p=>send(p.id,{k:'state',s:view(p)}));
-function handle(from,m,c){const p=byId(from);
- if(m.k==='join'){if(R.phase!=='lobby'||R.players.length>=12||R.players.some(x=>x.name===m.name))return c.send({k:'err',m:'تعذّر الانضمام (ممتلئة/بدأت/الاسم مكرر)'});
-  conns[from]=c;R.players.push({id:from,name:m.name,alive:true});return push()}
+function handle(from,m){if(m.k==="bye")return drop(from);const p=byId(from);
+ if(m.k==='join'){if(R.phase!=='lobby'||R.players.length>=12||R.players.some(x=>x.name===m.name))return send(from,{k:'err',m:'تعذّر الانضمام (ممتلئة/بدأت/الاسم مكرر)'});
+  if(p)return push();R.players.push({id:from,name:m.name,alive:true});return push()}
  if(!p)return;const v=byId(m.t);
  if(m.k==='act'&&R.phase==='night'&&p.alive&&v&&v.alive){
   if(p.role==='mafia'&&v.role!=='mafia')R.act.kill[from]=m.t;else if(p.role==='doctor')R.act.save=m.t;
@@ -127,9 +140,12 @@ function say(t,c,n){const m=$('msgs');m.insertAdjacentHTML('beforeend',`<p class
 $('ci').onkeydown=e=>{if(e.key==='Enter'&&e.target.value){act('chat',e.target.value);e.target.value=''}};
 setInterval(()=>{$('timer').textContent=st&&st.end&&['night','day'].includes(st.phase)?Math.max(0,Math.ceil((st.end-Date.now())/1000)):''},250);
 
-// ===== الصوت الداخلي =====
+// ===== الصوت الداخلي (WebRTC عبر PeerJS + خوادم TURN) =====
+const ICE=[{urls:'stun:stun.l.google.com:19302'},...[['turn:openrelay.metered.ca:80'],['turn:openrelay.metered.ca:443'],['turn:openrelay.metered.ca:443?transport=tcp']].map(u=>({urls:u[0],username:'openrelayproject',credential:'openrelayproject'}))];
+const vid=id=>'mv'+room+id;
 function play(id,s){let a=$('a'+id);if(!a){a=document.createElement('audio');a.id='a'+id;a.autoplay=true;document.body.appendChild(a)}a.srcObject=s}
-function calls(){peer.on('call',c=>{c.answer(stream);c.on('stream',s=>play(c.peer,s))})}
-async function voice(){try{stream=await navigator.mediaDevices.getUserMedia({audio:true})}catch{return alert('تعذّر الوصول إلى الميكروفون (يتطلب HTTPS أو localhost)')}
- $('vb').textContent='🎙️ الصوت يعمل';st.players.forEach(p=>{if(p.id!==myId){const c=peer.call(p.id,stream);c.on('stream',s=>play(p.id,s))}})}
+async function voice(){try{stream=await navigator.mediaDevices.getUserMedia({audio:true})}catch{return alert('تعذّر الوصول إلى الميكروفون (يتطلب HTTPS)')}
+ vpeer=new Peer(vid(myId),{config:{iceServers:ICE}});vpeer.on('error',()=>{});
+ vpeer.on('call',c=>{c.answer(stream);c.on('stream',s=>play(c.peer,s))});
+ vpeer.on('open',()=>{$('vb').textContent='🎙️ الصوت يعمل';st.players.forEach(p=>{if(p.id!==myId){const c=vpeer.call(vid(p.id),stream);c.on('stream',s=>play(vid(p.id),s))}})})}
 </script></body></html>
